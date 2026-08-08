@@ -38,6 +38,7 @@ from .utils import (
     FLAMEOutput,
     find_joint_kin_chain)
 from .vertex_joint_selector import VertexJointSelector
+from .vertex_keypoint_regressor import VerticeKeypointRegressor
 from collections import namedtuple
 
 TensorOutput = namedtuple('TensorOutput',
@@ -71,6 +72,8 @@ class SMPL(nn.Module):
         age: str = 'adult',
         vertex_ids: Dict[str, int] = None,
         v_template: Optional[Union[Tensor, Array]] = None,
+        J_regressor_kpt: Optional[Tensor] = None,
+        return_kpt: bool = False,
         **kwargs
     ) -> None:
         ''' SMPL model constructor
@@ -124,6 +127,13 @@ class SMPL(nn.Module):
             vertex_ids: dict, optional
                 A dictionary containing the indices of the extra vertices that
                 will be selected
+            v_template: torch.tensor, optional
+                The vertices of the template model
+            J_regressor_kpt: torch.tensor, optional
+                The J_regressor for the keypoint joints
+            return_kpt: bool, optional
+                If True, then the forward pass will return the keypoints
+                (default = False)
         '''
 
         self.gender = gender
@@ -135,8 +145,26 @@ class SMPL(nn.Module):
                 smpl_path = os.path.join(model_path, model_fn)
             else:
                 smpl_path = model_path
-            assert osp.exists(smpl_path), 'Path {} does not exist!'.format(
-                smpl_path)
+
+            # NOTE(YL 11/10):: sometimes this line creates problem
+            # assert osp.exists(smpl_path), 'Path {} does not exist!'.format(
+            #     smpl_path)
+            if not osp.exists(smpl_path):
+                if smpl_path == "/data/vision/polina/scratch/liuyingcheng/code/fetal_pose/smplx/models/smpl/SMPL_INFANT.pkl":
+                    alternative_path_list = [
+                        "/data/vision/polina/scratch/liuyingcheng/code/fetal_pose/smplx/models/smpl_model_backup/SMPL_INFANT.pkl",
+                        "/data/scratch-oc40/liuyingcheng/data/shared/smpl_model_backup/SMPL_INFANT.pkl",
+                    ]
+                    for alternative_path in alternative_path_list:
+                        if osp.exists(alternative_path):
+                            smpl_path = alternative_path
+                            break
+                    if not osp.exists(smpl_path):
+                        raise ValueError(f'Path {smpl_path} does not exist! '
+                                         'Cannot recover from backup paths.'
+                                         f'The hostname is {os.uname().nodename}')
+                else:
+                    raise ValueError(f'Path {smpl_path} does not exist!')
 
             with open(smpl_path, 'rb') as smpl_file:
                 data_struct = Struct(**pickle.load(smpl_file,
@@ -174,6 +202,8 @@ class SMPL(nn.Module):
             # SMPL and SMPL-H share the same topology, so any extra joints can
             # be drawn from the same place
             vertex_ids = VERTEX_IDS['smplh']
+
+        self.vertex_ids = vertex_ids
 
         self.dtype = dtype
 
@@ -268,6 +298,15 @@ class SMPL(nn.Module):
         lbs_weights = to_tensor(to_np(data_struct.weights), dtype=dtype)
         self.register_buffer('lbs_weights', lbs_weights)
 
+        if return_kpt:
+            self.vertex_keypoint_regressor = VerticeKeypointRegressor(
+                J_regressor=j_regressor,
+                vertex_ids=vertex_ids,
+                J_regressor_kpt=J_regressor_kpt
+            )
+        else:
+            self.vertex_keypoint_regressor = None
+
     @property
     def num_betas(self):
         return self._num_betas
@@ -291,6 +330,7 @@ class SMPL(nn.Module):
                 param.fill_(0)
 
     def get_num_verts(self) -> int:
+        raise NotImplementedError("should be shape[1]?")
         return self.v_template.shape[0]
 
     def get_num_faces(self) -> int:
@@ -375,19 +415,30 @@ class SMPL(nn.Module):
             num_repeats = int(batch_size / betas.shape[0])
             betas = betas.expand(num_repeats, -1)
 
+        if full_pose.shape[0] != batch_size:
+            num_repeats = int(batch_size / full_pose.shape[0])
+            full_pose = full_pose.expand(num_repeats, -1).contiguous()
+
         vertices, joints = lbs(betas, full_pose, self.v_template,
                                self.shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
                                self.lbs_weights, pose2rot=pose2rot)
 
         joints = self.vertex_joint_selector(vertices, joints)
+        if self.vertex_keypoint_regressor is not None:
+            joints = self.vertex_keypoint_regressor(vertices, joints)
+
         # Map the joints to the current dataset
         if self.joint_mapper is not None:
             joints = self.joint_mapper(joints)
 
         if apply_trans:
-            joints += transl.unsqueeze(dim=1)
-            vertices += transl.unsqueeze(dim=1)
+            # NOTE(YL 09/24):: this in-place operation will
+            # break the computation graph sometimes?
+            # joints += transl.unsqueeze(dim=1)
+            # vertices += transl.unsqueeze(dim=1)
+            joints = joints + transl.unsqueeze(dim=1)
+            vertices = vertices + transl.unsqueeze(dim=1)
 
         output = SMPLOutput(vertices=vertices if return_verts else None,
                             global_orient=global_orient,

@@ -236,18 +236,19 @@ def lbs(
 
     # 5. Do skinning:
     # W is N x V x (J + 1)
+    # NOTE(YL 09/17):: given a vertices, weights are mostly zeros. Only handful are 1.
     W = lbs_weights.unsqueeze(dim=0).expand([batch_size, -1, -1])
     # (N x V x (J + 1)) x (N x (J + 1) x 16)
     num_joints = J_regressor.shape[0]
     T = torch.matmul(W, A.view(batch_size, num_joints, 16)) \
-        .view(batch_size, -1, 4, 4)
+        .view(batch_size, -1, 4, 4)  # (B, V, 4, 4)
 
     homogen_coord = torch.ones([batch_size, v_posed.shape[1], 1],
-                               dtype=dtype, device=device)
-    v_posed_homo = torch.cat([v_posed, homogen_coord], dim=2)
-    v_homo = torch.matmul(T, torch.unsqueeze(v_posed_homo, dim=-1))
+                               dtype=dtype, device=device)  # (B, V, 1)
+    v_posed_homo = torch.cat([v_posed, homogen_coord], dim=2)  # (B, V, 4)
+    v_homo = torch.matmul(T, torch.unsqueeze(v_posed_homo, dim=-1))  # (B, V, 4, 1)
 
-    verts = v_homo[:, :, :3, 0]
+    verts = v_homo[:, :, :3, 0]  # (B, V, 3)
 
     return verts, J_transformed
 
@@ -403,3 +404,49 @@ def batch_rigid_transform(
         torch.matmul(transforms, joints_homogen), [3, 0, 0, 0, 0, 0, 0, 0])
 
     return posed_joints, rel_transforms
+
+
+def invert_rigid_transform(J_transformed, rot_mats, parents):
+    """
+    Inverts the batch_rigid_transform to recover the original joint positions.
+
+    Parameters
+    ----------
+    J_transformed : torch.tensor BxNx3
+        The transformed joint positions after applying the pose rotations.
+    rot_mats : torch.tensor BxNx3x3
+        Tensor of rotation matrices used in the forward transformation.
+    parents : torch.tensor N
+        The kinematic tree (parent indices) of each joint.
+
+    Returns
+    -------
+    joints : torch.tensor BxNx3
+        The original joint positions before the transformation.
+    """
+    B, N, _ = J_transformed.shape
+
+    # Initialize tensors for joints and cumulative rotations
+    joints = torch.zeros_like(J_transformed)
+    R_cumulative = torch.zeros(B, N, 3, 3, device=J_transformed.device, dtype=J_transformed.dtype)
+
+    # For the root joint (index 0)
+    joints[:, 0] = J_transformed[:, 0]
+    R_cumulative[:, 0] = rot_mats[:, 0]
+
+    for i in range(1, N):
+        parent = parents[i]
+
+        # Compute the inverse of the cumulative rotation of the parent joint
+        R_parent_inv = R_cumulative[:, parent].transpose(1, 2)
+
+        # Calculate the difference in positions between the current joint and its parent
+        delta_pos = J_transformed[:, i] - J_transformed[:, parent]
+
+        # Recover the original joint position
+        joints[:, i] = joints[:, parent] + torch.matmul(R_parent_inv, delta_pos.unsqueeze(-1)).squeeze(-1)
+
+        # Update the cumulative rotation
+        R_cumulative[:, i] = torch.matmul(R_cumulative[:, parent], rot_mats[:, i])
+
+    return joints
